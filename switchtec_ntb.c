@@ -40,32 +40,6 @@ module_param(use_crosslink, bool, 0644);
 MODULE_PARM_DESC(use_crosslink,
 		 "Enable crosslink (back to back switches)");
 
-struct crosslink_peer {
-	int cust_num;
-	int mw_count;
-	int bus_id;
-	u64 bar0_addr;
-	u64 mw_addrs[6];
-};
-
-static const struct crosslink_peer crosslink_peers[] = {
-	{
-		.cust_num = 1,
-		.mw_count = 1,
-		.bus_id = 2,
-		.bar0_addr = 0x90000000,
-		.mw_addrs = {0x40000000},
-	},
-	{
-		.cust_num = 2,
-		.mw_count = 1,
-		.bus_id = 1,
-		.bar0_addr = 0x80000000,
-		.mw_addrs = {0x00000000},
-	},
-	{}
-};
-
 #ifndef ioread64
 #ifdef readq
 #define ioread64 readq
@@ -842,8 +816,7 @@ static void switchtec_ntb_init_sndev(struct switchtec_ntb *sndev)
 
 static int config_rsvd_lut_win(struct switchtec_ntb *sndev,
 			       struct ntb_ctrl_regs __iomem *ctl,
-			       int lut_idx, int partition,
-			       dma_addr_t addr)
+			       int lut_idx, int partition, u64 addr)
 {
 	int bar = sndev->direct_mw_to_bar[0];
 	u32 ctl_val;
@@ -929,44 +902,12 @@ static int config_req_id_table(struct switchtec_ntb *sndev,
 	return 0;
 }
 
-static const struct crosslink_peer *
-crosslink_get_peer(struct switchtec_ntb *sndev)
-{
-	int cust_num;
-	const struct crosslink_peer *peer;
-
-	cust_num = ioread8(&sndev->stdev->mmio_sys_info->reserved_customer);
-	dev_dbg(&sndev->stdev->dev, "Crosslink Customer Number: %d\n",
-		cust_num);
-
-	for (peer = crosslink_peers;
-	     peer->cust_num != cust_num && peer->cust_num != 0; peer++);
-
-	if (peer->cust_num == 0) {
-		dev_err(&sndev->stdev->dev,
-			"Could not find crosslink peer information: %d\n",
-			cust_num);
-		return ERR_PTR(-EINVAL);
-	}
-
-	dev_dbg(&sndev->stdev->dev, "Crosslink: bar0=%llx, mws=%d",
-		peer->bar0_addr, peer->mw_count);
-
-	if (!peer->mw_count) {
-		dev_err(&sndev->stdev->dev,
-			"Must set at least one crosslink memory window address");
-		return ERR_PTR(-EINVAL);
-	}
-
-	return peer;
-}
-
 static int crosslink_setup_mws(struct switchtec_ntb *sndev, int ntb_lut_idx,
-			       const struct crosslink_peer *peer)
+			       u64 *mw_addrs, int mw_count)
 {
 	int rc, i;
 	struct ntb_ctrl_regs __iomem *ctl = sndev->mmio_self_ctrl;
-	dma_addr_t addr;
+	u64 addr;
 	size_t size, offset;
 	int bar;
 	int xlate_pos;
@@ -981,19 +922,19 @@ static int crosslink_setup_mws(struct switchtec_ntb *sndev, int ntb_lut_idx,
 		if (i == ntb_lut_idx)
 			continue;
 
-		addr = peer->mw_addrs[0] + LUT_SIZE * i;
+		addr = mw_addrs[0] + LUT_SIZE * i;
 
 		iowrite64((NTB_CTRL_LUT_EN | (sndev->peer_partition << 1) |
 			   addr),
 			  &ctl->lut_entry[i]);
 	}
 
-	sndev->nr_direct_mw = min_t(int, sndev->nr_direct_mw, peer->mw_count);
+	sndev->nr_direct_mw = min_t(int, sndev->nr_direct_mw, mw_count);
 
 	for (i = 0; i < sndev->nr_direct_mw; i++) {
 		bar = sndev->direct_mw_to_bar[i];
 		offset = (i == 0) ? LUT_SIZE * sndev->nr_lut_mw : 0;
-		addr = peer->mw_addrs[i] + offset;
+		addr = mw_addrs[i] + offset;
 		size = pci_resource_len(sndev->ntb.pdev, bar) - offset;
 		xlate_pos = ilog2(size);
 
@@ -1026,7 +967,7 @@ static int crosslink_setup_mws(struct switchtec_ntb *sndev, int ntb_lut_idx,
 }
 
 static int crosslink_setup_req_ids(struct switchtec_ntb *sndev,
-	struct ntb_ctrl_regs __iomem *mmio_ctrl, int bus_id)
+	struct ntb_ctrl_regs __iomem *mmio_ctrl)
 {
 	int req_ids[16];
 	int i;
@@ -1038,36 +979,78 @@ static int crosslink_setup_req_ids(struct switchtec_ntb *sndev,
 		if (!(proxy_id & NTB_CTRL_REQ_ID_EN))
 			break;
 
-		req_ids[i] = ((proxy_id >> 1) & 0xFF) | bus_id << 8;
+		req_ids[i] = ((proxy_id >> 1) & 0xFF);
 	}
 
 	return config_req_id_table(sndev, mmio_ctrl, req_ids, i);
+}
+
+/*
+ * In crosslink configuration there is a virtual partition in the
+ * middle of the two switches. The BARs in this partition have to be
+ * enumerated and assigned addresses.
+ */
+static int crosslink_enum_partition(struct switchtec_ntb *sndev,
+				    u64 *bar_addrs)
+{
+	struct part_cfg_regs __iomem *part_cfg =
+		&sndev->stdev->mmio_part_cfg_all[sndev->peer_partition];
+	u32 pff = ioread32(&part_cfg->vep_pff_inst_id);
+	struct pff_csr_regs __iomem *mmio_pff =
+		&sndev->stdev->mmio_pff_csr[pff];
+	const u64 bar_space = 0x1000000000LL;
+	u64 bar_addr;
+	int bar_cnt = 0;
+	int i;
+
+	iowrite16(0x6, &mmio_pff->pcicmd);
+
+	for (i = 0; i < ARRAY_SIZE(mmio_pff->pci_bar64); i++) {
+		iowrite64(bar_space * i, &mmio_pff->pci_bar64[i]);
+		bar_addr = ioread64(&mmio_pff->pci_bar64[i]);
+		bar_addr &= ~0xf;
+
+		dev_dbg(&sndev->stdev->dev,
+			"Crosslink BAR%d addr: %llx\n",
+			i, bar_addr);
+
+		if (bar_addr != bar_space * i)
+			continue;
+
+		bar_addrs[bar_cnt++] = bar_addr;
+	}
+
+	return bar_cnt;
 }
 
 static int switchtec_ntb_init_crosslink(struct switchtec_ntb *sndev)
 {
 	int rc;
 	int bar = sndev->direct_mw_to_bar[0];
-	dma_addr_t addr;
 	const int ntb_lut_idx = 1;
-	const struct crosslink_peer *peer;
 	struct ntb_ctrl_regs __iomem *mmio_ctrl, *mmio_peer_ctrl;
+	u64 bar_addrs[6];
+	u64 addr;
+	int bar_cnt;
 
 	if (!use_crosslink)
 		return 0;
 
-	peer = crosslink_get_peer(sndev);
-	if (IS_ERR(peer))
-		return PTR_ERR(peer);
+	bar_cnt = crosslink_enum_partition(sndev, bar_addrs);
+	if (bar_cnt < sndev->nr_direct_mw + 1) {
+		dev_err(&sndev->stdev->dev,
+			"Error enumerating crosslink partition\n");
+		return -EINVAL;
+	}
 
-	addr = peer->bar0_addr + SWITCHTEC_GAS_NTB_OFFSET;
-
+	addr = bar_addrs[0] + SWITCHTEC_GAS_NTB_OFFSET;
 	rc = config_rsvd_lut_win(sndev, sndev->mmio_self_ctrl, ntb_lut_idx,
 				 sndev->peer_partition, addr);
 	if (rc)
 		return rc;
 
-	rc = crosslink_setup_mws(sndev, ntb_lut_idx, peer);
+	rc = crosslink_setup_mws(sndev, ntb_lut_idx, &bar_addrs[1],
+				 bar_cnt - 1);
 	if (rc)
 		return rc;
 
@@ -1083,8 +1066,7 @@ static int switchtec_ntb_init_crosslink(struct switchtec_ntb *sndev)
 
 	mmio_peer_ctrl = &mmio_ctrl[sndev->peer_partition];
 
-	rc = crosslink_setup_req_ids(sndev, sndev->mmio_peer_ctrl,
-				     peer->bus_id);
+	rc = crosslink_setup_req_ids(sndev, sndev->mmio_peer_ctrl);
 	if (rc)
 		goto err_out;
 
