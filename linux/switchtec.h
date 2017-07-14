@@ -124,7 +124,12 @@ struct sys_info_regs {
 	u32 cfg_file_fmt_version;
 	u16 cfg_running;
 	u16 img_running;
-	u32 reserved2[57];
+	u32 reserved2[55];
+	u8 reserved3;
+	u8 reserved_customer;
+	u8 reserved4;
+	u8 use_vendor_id;
+	u32 vendor_table_revision2;
 	char vendor_id[8];
 	char product_id[16];
 	char product_revision[4];

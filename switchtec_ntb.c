@@ -35,6 +35,37 @@ module_param(use_lut_mws, bool, 0644);
 MODULE_PARM_DESC(use_lut_mws,
 		 "Enable the use of the LUT based memory windows");
 
+static bool use_crosslink;
+module_param(use_crosslink, bool, 0644);
+MODULE_PARM_DESC(use_crosslink,
+		 "Enable crosslink (back to back switches)");
+
+struct crosslink_peer {
+	int cust_num;
+	int mw_count;
+	int bus_id;
+	u64 bar0_addr;
+	u64 mw_addrs[6];
+};
+
+static const struct crosslink_peer crosslink_peers[] = {
+	{
+		.cust_num = 1,
+		.mw_count = 1,
+		.bus_id = 2,
+		.bar0_addr = 0x90000000,
+		.mw_addrs = {0x40000000},
+	},
+	{
+		.cust_num = 2,
+		.mw_count = 1,
+		.bus_id = 1,
+		.bar0_addr = 0x80000000,
+		.mw_addrs = {0x00000000},
+	},
+	{}
+};
+
 #ifndef ioread64
 #ifdef readq
 #define ioread64 readq
@@ -89,6 +120,7 @@ struct switchtec_ntb {
 	int message_irq;
 
 	struct ntb_info_regs __iomem *mmio_ntb;
+	struct ntb_info_regs __iomem *mmio_xlink_ntb;
 	struct ntb_ctrl_regs __iomem *mmio_ctrl;
 	struct ntb_dbmsg_regs __iomem *mmio_dbmsg;
 	struct ntb_ctrl_regs __iomem *mmio_self_ctrl;
@@ -897,6 +929,185 @@ static int config_req_id_table(struct switchtec_ntb *sndev,
 	return 0;
 }
 
+static const struct crosslink_peer *
+crosslink_get_peer(struct switchtec_ntb *sndev)
+{
+	int cust_num;
+	const struct crosslink_peer *peer;
+
+	cust_num = ioread8(&sndev->stdev->mmio_sys_info->reserved_customer);
+	dev_dbg(&sndev->stdev->dev, "Crosslink Customer Number: %d\n",
+		cust_num);
+
+	for (peer = crosslink_peers;
+	     peer->cust_num != cust_num && peer->cust_num != 0; peer++);
+
+	if (peer->cust_num == 0) {
+		dev_err(&sndev->stdev->dev,
+			"Could not find crosslink peer information: %d\n",
+			cust_num);
+		return ERR_PTR(-EINVAL);
+	}
+
+	dev_dbg(&sndev->stdev->dev, "Crosslink: bar0=%llx, mws=%d",
+		peer->bar0_addr, peer->mw_count);
+
+	if (!peer->mw_count) {
+		dev_err(&sndev->stdev->dev,
+			"Must set at least one crosslink memory window address");
+		return ERR_PTR(-EINVAL);
+	}
+
+	return peer;
+}
+
+static int crosslink_setup_mws(struct switchtec_ntb *sndev, int ntb_lut_idx,
+			       const struct crosslink_peer *peer)
+{
+	int rc, i;
+	struct ntb_ctrl_regs __iomem *ctl = sndev->mmio_self_ctrl;
+	dma_addr_t addr;
+	size_t size, offset;
+	int bar;
+	int xlate_pos;
+	u32 ctl_val;
+
+	rc = switchtec_ntb_part_op(sndev, ctl, NTB_CTRL_PART_OP_LOCK,
+				   NTB_CTRL_PART_STATUS_LOCKED);
+	if (rc)
+		return rc;
+
+	for (i = 0; i < sndev->nr_lut_mw; i++) {
+		if (i == ntb_lut_idx)
+			continue;
+
+		addr = peer->mw_addrs[0] + LUT_SIZE * i;
+
+		iowrite64((NTB_CTRL_LUT_EN | (sndev->peer_partition << 1) |
+			   addr),
+			  &ctl->lut_entry[i]);
+	}
+
+	sndev->nr_direct_mw = min_t(int, sndev->nr_direct_mw, peer->mw_count);
+
+	for (i = 0; i < sndev->nr_direct_mw; i++) {
+		bar = sndev->direct_mw_to_bar[i];
+		offset = (i == 0) ? LUT_SIZE * sndev->nr_lut_mw : 0;
+		addr = peer->mw_addrs[i] + offset;
+		size = pci_resource_len(sndev->ntb.pdev, bar) - offset;
+		xlate_pos = ilog2(size);
+
+		if (offset && size > offset)
+			size = offset;
+
+		ctl_val = ioread32(&ctl->bar_entry[bar].ctl);
+		ctl_val |= NTB_CTRL_BAR_DIR_WIN_EN;
+
+		iowrite32(ctl_val, &ctl->bar_entry[bar].ctl);
+		iowrite32(xlate_pos | size, &ctl->bar_entry[bar].win_size);
+		iowrite64(sndev->peer_partition | addr,
+			  &ctl->bar_entry[bar].xlate_addr);
+	}
+
+	rc = switchtec_ntb_part_op(sndev, ctl, NTB_CTRL_PART_OP_CFG,
+				   NTB_CTRL_PART_STATUS_NORMAL);
+	if (rc) {
+		u32 bar_error, lut_error;
+
+		bar_error = ioread32(&ctl->bar_error);
+		lut_error = ioread32(&ctl->lut_error);
+		dev_err(&sndev->stdev->dev,
+			"Error setting up cross link windows: %08x / %08x",
+			bar_error, lut_error);
+		return rc;
+	}
+
+	return 0;
+}
+
+static int crosslink_setup_req_ids(struct switchtec_ntb *sndev,
+	struct ntb_ctrl_regs __iomem *mmio_ctrl, int bus_id)
+{
+	int req_ids[16];
+	int i;
+	u32 proxy_id;
+
+	for (i = 0; i < ARRAY_SIZE(req_ids); i++) {
+		proxy_id = ioread32(&sndev->mmio_self_ctrl->req_id_table[i]);
+
+		if (!(proxy_id & NTB_CTRL_REQ_ID_EN))
+			break;
+
+		req_ids[i] = ((proxy_id >> 1) & 0xFF) | bus_id << 8;
+	}
+
+	return config_req_id_table(sndev, mmio_ctrl, req_ids, i);
+}
+
+static int switchtec_ntb_init_crosslink(struct switchtec_ntb *sndev)
+{
+	int rc;
+	int bar = sndev->direct_mw_to_bar[0];
+	dma_addr_t addr;
+	const int ntb_lut_idx = 1;
+	const struct crosslink_peer *peer;
+	struct ntb_ctrl_regs __iomem *mmio_ctrl, *mmio_peer_ctrl;
+
+	if (!use_crosslink)
+		return 0;
+
+	peer = crosslink_get_peer(sndev);
+	if (IS_ERR(peer))
+		return PTR_ERR(peer);
+
+	addr = peer->bar0_addr + SWITCHTEC_GAS_NTB_OFFSET;
+
+	rc = config_rsvd_lut_win(sndev, sndev->mmio_self_ctrl, ntb_lut_idx,
+				 sndev->peer_partition, addr);
+	if (rc)
+		return rc;
+
+	rc = crosslink_setup_mws(sndev, ntb_lut_idx, peer);
+	if (rc)
+		return rc;
+
+	sndev->mmio_xlink_ntb = pci_iomap_range(sndev->stdev->pdev, bar,
+						LUT_SIZE, LUT_SIZE);
+	if (!sndev->mmio_xlink_ntb) {
+		rc = -ENOMEM;
+		return rc;
+	}
+
+	mmio_ctrl = (void * __iomem)sndev->mmio_ntb +
+		SWITCHTEC_NTB_REG_CTRL_OFFSET;
+
+	mmio_peer_ctrl = &mmio_ctrl[sndev->peer_partition];
+
+	rc = crosslink_setup_req_ids(sndev, sndev->mmio_peer_ctrl,
+				     peer->bus_id);
+	if (rc)
+		goto err_out;
+
+	sndev->nr_rsvd_luts++;
+
+	return 0;
+
+err_out:
+	pci_iounmap(sndev->stdev->pdev, sndev->mmio_xlink_ntb);
+	return rc;
+}
+
+static void switchtec_ntb_deinit_crosslink(struct switchtec_ntb *sndev)
+{
+	if (!use_crosslink)
+		return;
+
+	sndev->nr_rsvd_luts--;
+
+	if (sndev->mmio_xlink_ntb)
+		pci_iounmap(sndev->stdev->pdev, sndev->mmio_xlink_ntb);
+}
+
 static int map_bars(int *map, struct ntb_ctrl_regs __iomem *ctrl)
 {
 	int i;
@@ -1179,16 +1390,21 @@ static int switchtec_ntb_add(struct device *dev,
 	sndev->stdev = stdev;
 	switchtec_ntb_init_sndev(sndev);
 	switchtec_ntb_init_mw(sndev);
-	switchtec_ntb_init_db(sndev);
-	switchtec_ntb_init_msgs(sndev);
 
 	rc = switchtec_ntb_init_req_id_table(sndev);
 	if (rc)
 		goto free_and_exit;
 
-	rc = switchtec_ntb_init_shared_mw(sndev);
+	rc = switchtec_ntb_init_crosslink(sndev);
 	if (rc)
 		goto free_and_exit;
+
+	switchtec_ntb_init_db(sndev);
+	switchtec_ntb_init_msgs(sndev);
+
+	rc = switchtec_ntb_init_shared_mw(sndev);
+	if (rc)
+		goto deinit_crosslink;
 
 	rc = switchtec_ntb_init_db_msg_irq(sndev);
 	if (rc)
@@ -1210,6 +1426,8 @@ deinit_and_exit:
 	switchtec_ntb_deinit_db_msg_irq(sndev);
 deinit_shared_and_exit:
 	switchtec_ntb_deinit_shared_mw(sndev);
+deinit_crosslink:
+	switchtec_ntb_deinit_crosslink(sndev);
 free_and_exit:
 	kfree(sndev);
 	dev_err(dev, "failed to register ntb device: %d", rc);
@@ -1230,6 +1448,7 @@ void switchtec_ntb_remove(struct device *dev,
 	ntb_unregister_device(&sndev->ntb);
 	switchtec_ntb_deinit_db_msg_irq(sndev);
 	switchtec_ntb_deinit_shared_mw(sndev);
+	switchtec_ntb_deinit_crosslink(sndev);
 	kfree(sndev);
 	dev_info(dev, "ntb device unregistered");
 }
